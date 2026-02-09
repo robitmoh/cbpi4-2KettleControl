@@ -18,11 +18,11 @@ import time
     Property.Number(label="Mash_Hysteresis", configurable=True, default_value=0.3,
                     description="MASH pump switching hysteresis in degrees. Heating pump activates when MASH < target - hysteresis, circulation pump (agitator) activates when MASH >= target."),
     Property.Number(label="P", configurable=True, default_value=5.0,
-                    description="MASH PID P value. Recommended: 2-10. Controls how aggressively the system reacts to temperature difference."),
+                    description="MASH PID P value. Recommended: 2-10. Higher = starts heating sooner when temp drops below target."),
     Property.Number(label="I", configurable=True, default_value=0.01,
-                    description="MASH PID I value. Recommended: 0.001-0.05. Low values prevent integral windup that delays pump switching."),
-    Property.Number(label="D", configurable=True, default_value=2.0,
-                    description="MASH PID D value. Recommended: 0-5. Dampens oscillation near target temperature."),
+                    description="MASH PID I value. Recommended: 0.001-0.05. Keep low. Compensates for steady-state error over time."),
+    Property.Number(label="D", configurable=True, default_value=5.0,
+                    description="MASH PID D value. Recommended: 3-15. KEY for overshoot prevention: detects rate of temperature rise and stops heating BEFORE target. Increase if MASH overshoots, decrease if pumps switch too early."),
     Property.Select(label="SampleTime", options=[2, 5],
                     description="PID calculation interval in seconds. Default: 5"),
     Property.Number(label="Rest_Interval", configurable=True, default_value=600,
@@ -108,10 +108,11 @@ class TwoKettleControl(CBPiKettleLogic):
     # ──────────────────────────────────────────────
     async def mash_temp_control(self):
         """MASH PID control with hysteresis for pump switching.
-        Uses PID output combined with hysteresis to set needs_heating flag.
+        The PID D term detects the rate of temperature rise and stops heating
+        BEFORE the target is reached, preventing overshoot in slow systems.
+        - Stops heating when PID output <= 0 (D term anticipates overshoot)
+          or as safety fallback when MASH temp >= target
         - Starts heating when MASH temp < target - mash_hysteresis AND PID output > 0
-        - Stops heating when MASH temp >= target
-        This prevents rapid pump switching near the target temperature.
         """
         while self.running:
             try:
@@ -120,22 +121,30 @@ class TwoKettleControl(CBPiKettleLogic):
 
                 pid_output = self.pid.calc(mash_temp, mash_target)
 
-                # Hysteresis-based pump switching decision
                 if self.needs_heating:
-                    # Currently heating: stop only when MASH reaches target
-                    if mash_temp >= mash_target:
+                    # Currently heating: PID decides when to stop
+                    # D term sees temp rising and reduces output to 0 BEFORE target
+                    # Safety: also stop if temp somehow reaches/exceeds target
+                    if pid_output <= 0:
                         self.needs_heating = False
                         self.pid.reset_integral()
                         self._logger.info(
-                            "MASH reached target: {:.1f}°C >= {:.1f}°C -> switching to CIRCULATION (agitator)".format(
+                            "PID stop heating: temp={:.1f}°C target={:.1f}°C PID={:.1f} -> CIRCULATION".format(
+                                mash_temp, mash_target, pid_output))
+                    elif mash_temp >= mash_target:
+                        self.needs_heating = False
+                        self.pid.reset_integral()
+                        self._logger.info(
+                            "Safety stop: temp={:.1f}°C >= target={:.1f}°C -> CIRCULATION".format(
                                 mash_temp, mash_target))
                 else:
-                    # Currently circulating: start heating when temp drops below threshold AND PID wants heat
+                    # Currently circulating: start heating when temp drops below threshold
                     if mash_temp < mash_target - self.mash_hysteresis and pid_output > 0:
                         self.needs_heating = True
                         self._logger.info(
-                            "MASH needs heating: {:.1f}°C < {:.1f}°C -> switching to HEATING (heater pump)".format(
-                                mash_temp, mash_target - self.mash_hysteresis))
+                            "MASH needs heating: {:.1f}°C < {:.1f}°C (hyst={:.1f}) PID={:.1f} -> HEATING".format(
+                                mash_temp, mash_target - self.mash_hysteresis,
+                                self.mash_hysteresis, pid_output))
 
                 self._logger.debug(
                     "MASH PID: temp={:.1f} target={:.1f} output={:.1f} heating={}".format(
@@ -198,7 +207,7 @@ class TwoKettleControl(CBPiKettleLogic):
             self.sample_time = int(self.props.get("SampleTime", 5))
             p = float(self.props.get("P", 5.0))
             i = float(self.props.get("I", 0.01))
-            d = float(self.props.get("D", 2.0))
+            d = float(self.props.get("D", 5.0))
             self.pid = PIDArduino(self.sample_time, p, i, d, 0, 100)
 
             # HLT parameters
