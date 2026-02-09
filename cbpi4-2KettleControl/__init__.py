@@ -6,29 +6,31 @@ import time
 
 @parameters([
     Property.Kettle(label="HLT_Kettle",
-                    description="HLT (Hot Liquor Tank) kettle - provides sensor and heater"),
+                    description="Select the HLT (Hot Liquor Tank) kettle. Its assigned sensor and heater will be used for HLT temperature control."),
     Property.Actor(label="Mash_Heater_Pump",
-                   description="Pump that circulates wort through the HLT heat exchanger (heating)"),
+                   description="HEATING pump - circulates wort FROM the MASH tun THROUGH the HLT heat exchanger coil and back. Used when MASH needs heating."),
     Property.Actor(label="Mash_Pump",
-                   description="Pump that circulates wort inside the MASH tun"),
+                   description="CIRCULATION pump - circulates wort INSIDE the MASH tun only. Used when MASH is at target temperature (no heating needed)."),
     Property.Number(label="DeltaTemp", configurable=True, default_value=10,
-                    description="HLT target temp = MASH target + DeltaTemp"),
+                    description="HLT target = MASH target + DeltaTemp. Example: MASH target 65°C + delta 10 = HLT target 75°C"),
     Property.Number(label="Max_HLT_Temp", configurable=True, default_value=85,
-                    description="Maximum HLT temperature upper limit"),
+                    description="Maximum HLT temperature limit. HLT target will never exceed this value regardless of DeltaTemp."),
     Property.Number(label="HLT_Hysteresis", configurable=True, default_value=0.5,
-                    description="HLT hysteresis band - heater turns on when HLT < target - hysteresis"),
-    Property.Number(label="P", configurable=True, default_value=117.0795,
-                    description="MASH PID P value"),
-    Property.Number(label="I", configurable=True, default_value=0.2747,
-                    description="MASH PID I value"),
-    Property.Number(label="D", configurable=True, default_value=41.58,
-                    description="MASH PID D value"),
+                    description="HLT heater hysteresis band in degrees. Heater ON when HLT < target - hysteresis, OFF when HLT >= target."),
+    Property.Number(label="Mash_Hysteresis", configurable=True, default_value=0.3,
+                    description="MASH pump switching hysteresis in degrees. Heater pump activates when MASH < target - hysteresis, mash pump activates when MASH >= target."),
+    Property.Number(label="P", configurable=True, default_value=5.0,
+                    description="MASH PID P value. Recommended: 2-10. Controls how aggressively the system reacts to temperature difference."),
+    Property.Number(label="I", configurable=True, default_value=0.01,
+                    description="MASH PID I value. Recommended: 0.001-0.05. Low values prevent integral windup that delays pump switching."),
+    Property.Number(label="D", configurable=True, default_value=2.0,
+                    description="MASH PID D value. Recommended: 0-5. Dampens oscillation near target temperature."),
     Property.Select(label="SampleTime", options=[2, 5],
-                    description="PID sample time in seconds. Default: 5"),
+                    description="PID calculation interval in seconds. Default: 5"),
     Property.Number(label="Rest_Interval", configurable=True, default_value=600,
-                    description="Mash Pump rest: run time in seconds before resting"),
+                    description="CIRCULATION pump work time in seconds before resting. Only applies to Mash_Pump in circulation mode. Default: 600 (10 min)"),
     Property.Number(label="Rest_Time", configurable=True, default_value=60,
-                    description="Mash Pump rest: rest duration in seconds")])
+                    description="CIRCULATION pump rest duration in seconds. Mash_Pump pauses for this long after each Rest_Interval. Default: 60 (1 min)")])
 
 class TwoKettleControl(CBPiKettleLogic):
 
@@ -52,6 +54,8 @@ class TwoKettleControl(CBPiKettleLogic):
         self.max_hlt_temp = None
         self.hlt_hysteresis = None
         self.hlt_heater_on = False
+        # MASH switching parameters
+        self.mash_hysteresis = None
         # Pump rest parameters
         self.work_time = None
         self.rest_time = None
@@ -102,12 +106,14 @@ class TwoKettleControl(CBPiKettleLogic):
             await asyncio.sleep(1)
 
     # ──────────────────────────────────────────────
-    # MASH temperature control - PID
+    # MASH temperature control - PID with hysteresis
     # ──────────────────────────────────────────────
     async def mash_temp_control(self):
-        """MASH PID control.
-        Sets the needs_heating flag based on PID output,
-        which drives the pump_control logic.
+        """MASH PID control with hysteresis for pump switching.
+        Uses PID output combined with hysteresis to set needs_heating flag.
+        - Starts heating when MASH temp < target - mash_hysteresis AND PID output > 0
+        - Stops heating when MASH temp >= target
+        This prevents rapid pump switching near the target temperature.
         """
         while self.running:
             try:
@@ -115,7 +121,24 @@ class TwoKettleControl(CBPiKettleLogic):
                 mash_target = self.get_kettle_target_temp(self.id)
 
                 pid_output = self.pid.calc(mash_temp, mash_target)
-                self.needs_heating = (pid_output > 0)
+
+                # Hysteresis-based pump switching decision
+                if self.needs_heating:
+                    # Currently heating: stop only when MASH reaches target
+                    if mash_temp >= mash_target:
+                        self.needs_heating = False
+                        self.pid.reset_integral()
+                        self._logger.debug(
+                            "MASH reached target: {:.1f}°C >= {:.1f}°C -> switching to circulation".format(
+                                mash_temp, mash_target))
+                else:
+                    # Currently circulating: start heating when temp drops below threshold AND PID wants heat
+                    if mash_temp < mash_target - self.mash_hysteresis and pid_output > 0:
+                        self.needs_heating = True
+                        self._logger.debug(
+                            "MASH needs heating: {:.1f}°C < {:.1f}°C (target {:.1f} - hyst {:.1f}) PID={:.1f}".format(
+                                mash_temp, mash_target - self.mash_hysteresis,
+                                mash_target, self.mash_hysteresis, pid_output))
 
                 self._logger.debug(
                     "MASH PID: current={:.1f}°C target={:.1f}°C output={:.1f} heating={}".format(
@@ -176,15 +199,18 @@ class TwoKettleControl(CBPiKettleLogic):
         try:
             # PID parameters
             self.sample_time = int(self.props.get("SampleTime", 5))
-            p = float(self.props.get("P", 117.0795))
-            i = float(self.props.get("I", 0.2747))
-            d = float(self.props.get("D", 41.58))
+            p = float(self.props.get("P", 5.0))
+            i = float(self.props.get("I", 0.01))
+            d = float(self.props.get("D", 2.0))
             self.pid = PIDArduino(self.sample_time, p, i, d, 0, 100)
 
             # HLT parameters
             self.delta_temp = float(self.props.get("DeltaTemp", 10))
             self.max_hlt_temp = float(self.props.get("Max_HLT_Temp", 85))
             self.hlt_hysteresis = float(self.props.get("HLT_Hysteresis", 0.5))
+
+            # MASH switching parameters
+            self.mash_hysteresis = float(self.props.get("Mash_Hysteresis", 0.3))
 
             # Pump rest parameters
             self.work_time = float(self.props.get("Rest_Interval", 600))
@@ -265,6 +291,10 @@ class PIDArduino(object):
             self._getTimeMs = self._currentTimeMs
         else:
             self._getTimeMs = getTimeMs
+
+    def reset_integral(self):
+        """Reset the integral term to prevent windup when switching modes."""
+        self._iTerm = 0
 
     def calc(self, inputValue, setpoint):
         now = self._getTimeMs()
