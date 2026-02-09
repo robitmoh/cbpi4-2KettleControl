@@ -6,11 +6,9 @@ import time
 
 @parameters([
     Property.Kettle(label="HLT_Kettle",
-                    description="Select the HLT (Hot Liquor Tank) kettle. Its assigned sensor and heater will be used for HLT temperature control."),
-    Property.Actor(label="Mash_Heater_Pump",
-                   description="HEATING pump - circulates wort FROM the MASH tun THROUGH the HLT heat exchanger coil and back. Used when MASH needs heating."),
+                    description="Select the HLT (Hot Liquor Tank) kettle. Its sensor and heater will be used for HLT temperature control."),
     Property.Actor(label="Mash_Pump",
-                   description="CIRCULATION pump - circulates wort INSIDE the MASH tun only. Used when MASH is at target temperature (no heating needed)."),
+                   description="CIRCULATION pump - circulates wort INSIDE the MASH tun. Runs when MASH is at target temperature (no heating needed). The HEATING pump is the MASH kettle's own Actor (heater)."),
     Property.Number(label="DeltaTemp", configurable=True, default_value=10,
                     description="HLT target = MASH target + DeltaTemp. Example: MASH target 65°C + delta 10 = HLT target 75°C"),
     Property.Number(label="Max_HLT_Temp", configurable=True, default_value=85,
@@ -18,7 +16,7 @@ import time
     Property.Number(label="HLT_Hysteresis", configurable=True, default_value=0.5,
                     description="HLT heater hysteresis band in degrees. Heater ON when HLT < target - hysteresis, OFF when HLT >= target."),
     Property.Number(label="Mash_Hysteresis", configurable=True, default_value=0.3,
-                    description="MASH pump switching hysteresis in degrees. Heater pump activates when MASH < target - hysteresis, mash pump activates when MASH >= target."),
+                    description="MASH pump switching hysteresis in degrees. Heating pump activates when MASH < target - hysteresis, circulation pump (agitator) activates when MASH >= target."),
     Property.Number(label="P", configurable=True, default_value=5.0,
                     description="MASH PID P value. Recommended: 2-10. Controls how aggressively the system reacts to temperature difference."),
     Property.Number(label="I", configurable=True, default_value=0.01,
@@ -28,9 +26,9 @@ import time
     Property.Select(label="SampleTime", options=[2, 5],
                     description="PID calculation interval in seconds. Default: 5"),
     Property.Number(label="Rest_Interval", configurable=True, default_value=600,
-                    description="CIRCULATION pump work time in seconds before resting. Only applies to Mash_Pump in circulation mode. Default: 600 (10 min)"),
+                    description="Agitator (circulation pump) work time in seconds before resting. Only used when MASH is at target. Default: 600 (10 min)"),
     Property.Number(label="Rest_Time", configurable=True, default_value=60,
-                    description="CIRCULATION pump rest duration in seconds. Mash_Pump pauses for this long after each Rest_Interval. Default: 60 (1 min)")])
+                    description="Agitator (circulation pump) rest duration in seconds. Default: 60 (1 min)")])
 
 class TwoKettleControl(CBPiKettleLogic):
 
@@ -43,8 +41,8 @@ class TwoKettleControl(CBPiKettleLogic):
         self.hlt_kettle = None
         self.hlt_heater = None
         # Pump references
-        self.heater_pump = None  # Circulates through HLT heat exchanger
-        self.mash_pump = None    # Circulates inside MASH tun
+        self.heater_pump = None  # mash_kettle.heater (actor) - circulates through HLT heat exchanger
+        self.mash_pump = None    # Property.Actor - circulates inside MASH tun
         # PID and control variables
         self.pid = None
         self.sample_time = None
@@ -128,20 +126,19 @@ class TwoKettleControl(CBPiKettleLogic):
                     if mash_temp >= mash_target:
                         self.needs_heating = False
                         self.pid.reset_integral()
-                        self._logger.debug(
-                            "MASH reached target: {:.1f}°C >= {:.1f}°C -> switching to circulation".format(
+                        self._logger.info(
+                            "MASH reached target: {:.1f}°C >= {:.1f}°C -> switching to CIRCULATION (agitator)".format(
                                 mash_temp, mash_target))
                 else:
                     # Currently circulating: start heating when temp drops below threshold AND PID wants heat
                     if mash_temp < mash_target - self.mash_hysteresis and pid_output > 0:
                         self.needs_heating = True
-                        self._logger.debug(
-                            "MASH needs heating: {:.1f}°C < {:.1f}°C (target {:.1f} - hyst {:.1f}) PID={:.1f}".format(
-                                mash_temp, mash_target - self.mash_hysteresis,
-                                mash_target, self.mash_hysteresis, pid_output))
+                        self._logger.info(
+                            "MASH needs heating: {:.1f}°C < {:.1f}°C -> switching to HEATING (heater pump)".format(
+                                mash_temp, mash_target - self.mash_hysteresis))
 
                 self._logger.debug(
-                    "MASH PID: current={:.1f}°C target={:.1f}°C output={:.1f} heating={}".format(
+                    "MASH PID: temp={:.1f} target={:.1f} output={:.1f} heating={}".format(
                         mash_temp, mash_target, pid_output, self.needs_heating))
 
             except Exception as e:
@@ -163,17 +160,17 @@ class TwoKettleControl(CBPiKettleLogic):
                 # Heating mode: heater pump circulates through HLT heat exchanger
                 await self.actor_off(self.mash_pump)
                 await self.actor_on(self.heater_pump)
-                self._logger.debug("Heating mode: heater pump ON")
+                self._logger.info("Heating mode: heater pump (actor) ON, agitator OFF")
                 # Wait while heating is needed, check every 1 second
                 while self.running and self.needs_heating:
                     await asyncio.sleep(1)
                 # Heating done, turn off heater pump
                 await self.actor_off(self.heater_pump)
             else:
-                # Circulation mode: mash pump circulates with rest interval
+                # Circulation mode: agitator circulates with rest interval
                 await self.actor_off(self.heater_pump)
                 await self.actor_on(self.mash_pump)
-                self._logger.debug("Circulation mode: mash pump ON ({:.0f}s)".format(self.work_time))
+                self._logger.info("Circulation mode: agitator ON ({:.0f}s), heater pump (actor) OFF".format(self.work_time))
 
                 # Mash pump runs for work_time (or until heating is needed)
                 off_time = time.time() + self.work_time
@@ -186,7 +183,7 @@ class TwoKettleControl(CBPiKettleLogic):
 
                 # Rest: mash pump off for rest_time
                 await self.actor_off(self.mash_pump)
-                self._logger.debug("Mash pump resting ({:.0f}s)".format(self.rest_time))
+                self._logger.info("Agitator resting ({:.0f}s)".format(self.rest_time))
                 rest_end = time.time() + self.rest_time
                 while self.running and not self.needs_heating and time.time() < rest_end:
                     await asyncio.sleep(1)
@@ -218,6 +215,12 @@ class TwoKettleControl(CBPiKettleLogic):
 
             # MASH kettle (the one this logic is assigned to)
             self.mash_kettle = self.get_kettle(self.id)
+            # Heater pump = MASH kettle's actor (heater) - circulates through HLT heat exchanger
+            self.heater_pump = self.mash_kettle.heater
+            # Circulation pump = from Property.Actor - circulates inside MASH tun
+            self.mash_pump = self.props.get("Mash_Pump", None)
+            if self.mash_pump is None:
+                raise ValueError("Mash_Pump is not configured!")
 
             # HLT kettle (from Property.Kettle)
             hlt_kettle_id = self.props.get("HLT_Kettle", None)
@@ -226,20 +229,14 @@ class TwoKettleControl(CBPiKettleLogic):
             self.hlt_kettle = self.get_kettle(hlt_kettle_id)
             self.hlt_heater = self.hlt_kettle.heater
 
-            # Pumps (from Property.Actor)
-            self.heater_pump = self.props.get("Mash_Heater_Pump", None)
-            if self.heater_pump is None:
-                raise ValueError("Mash_Heater_Pump is not configured!")
-            self.mash_pump = self.props.get("Mash_Pump", None)
-            if self.mash_pump is None:
-                raise ValueError("Mash_Pump is not configured!")
-
             self.needs_heating = False
             self.hlt_heater_on = False
 
-            logging.info("2KettleControl started - PID P:{} I:{} D:{} | HLT delta:{} max:{} hyst:{} | MASH kettle:{} HLT kettle:{}".format(
+            logging.info("2KettleControl started | PID P:{} I:{} D:{} | HLT delta:{} max:{} hyst:{} | "
+                         "MASH sensor:{} heater_pump:{} mash_pump:{} | HLT sensor:{} hlt_heater:{}".format(
                 p, i, d, self.delta_temp, self.max_hlt_temp, self.hlt_hysteresis,
-                self.mash_kettle, self.hlt_kettle))
+                self.mash_kettle.sensor, self.heater_pump, self.mash_pump,
+                self.hlt_kettle.sensor, self.hlt_heater))
 
             # Start 3 parallel control tasks
             hlt_task = asyncio.create_task(self.hlt_heater_control())
